@@ -71,6 +71,7 @@ func GetDownloadUrl(fileID string) (string, bool) {
 	fileURL := file.Link(conf.BotToken)
 	return fileURL, true
 }
+
 func BotDo() {
 	bot, err := tgbotapi.NewBotAPI(conf.BotToken)
 	if err != nil {

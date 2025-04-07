@@ -1,5 +1,6 @@
 package main
 
+//go run main.go -token=7722345745:AAF2yXMhJ7S7IdaF2Co7pCXn31LEpAHmSJs -target=@fffileCloudGroup -tgbotapiproxy=https://tgbot.barrierfree.ip-ddns.com
 import (
 	"flag"
 	"fmt"
@@ -53,7 +54,9 @@ func init() {
 	flag.StringVar(&conf.Pass, "pass", os.Getenv("pass"), "Visit Password")
 	flag.StringVar(&conf.Mode, "mode", os.Getenv("mode"), "Run mode")
 	flag.StringVar(&conf.BaseUrl, "url", os.Getenv("url"), "Base Url")
+	flag.StringVar(&conf.TgBotApiProxy, "tgbotapiproxy", os.Getenv("tgbotapiproxy"), "Telegram Bot API Proxy")
 	flag.Parse()
+	
 	if conf.Mode == "m" {
 		OptApi = false
 	}
