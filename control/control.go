@@ -8,15 +8,166 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"csz.net/tgstate/assets"
 	"csz.net/tgstate/conf"
 	"csz.net/tgstate/utils"
 )
+
+// 文件缓存结构
+type FileCache struct {
+	sync.RWMutex
+	files      map[string]string // fileID -> 本地文件路径
+	lastAccess map[string]int64  // fileID -> 最后访问时间
+	cacheDir   string            // 缓存目录
+}
+
+var (
+	fileCache *FileCache
+	once      sync.Once
+)
+
+// 获取文件缓存单例
+func getFileCache() *FileCache {
+	once.Do(func() {
+		cacheDir := filepath.Join(".", "file_cache")
+		if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+			os.MkdirAll(cacheDir, 0755)
+		}
+		fileCache = &FileCache{
+			files:      make(map[string]string),
+			lastAccess: make(map[string]int64),
+			cacheDir:   cacheDir,
+		}
+		// 启动定期清理协程
+		go fileCache.periodicCleanup()
+	})
+	return fileCache
+}
+
+// 获取缓存文件，如果不存在则下载
+func (fc *FileCache) getCachedFile(fileID string) (string, error) {
+	// 检查缓存
+	fc.RLock()
+	filePath, exists := fc.files[fileID]
+	fc.RUnlock()
+
+	if exists {
+		// 检查文件是否存在
+		if _, err := os.Stat(filePath); err == nil {
+			// 更新最后访问时间
+			fc.Lock()
+			fc.lastAccess[fileID] = time.Now().Unix()
+			fc.Unlock()
+			return filePath, nil
+		}
+	}
+
+	// 缓存不存在或文件已删除，下载文件
+	fileURL, ok := utils.GetDownloadUrl(fileID)
+	if !ok {
+		return "", fmt.Errorf("获取文件下载链接失败")
+	}
+
+	// 创建缓存文件
+	filePath = filepath.Join(fc.cacheDir, fileID)
+	out, err := os.Create(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+
+	// 下载文件
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		os.Remove(filePath)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		os.Remove(filePath)
+		return "", fmt.Errorf("下载文件失败，状态码: %d", resp.StatusCode)
+	}
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		os.Remove(filePath)
+		return "", err
+	}
+
+	// 更新缓存
+	fc.Lock()
+	fc.files[fileID] = filePath
+	fc.lastAccess[fileID] = time.Now().Unix()
+	fc.Unlock()
+
+	return filePath, nil
+}
+
+// 清理指定文件
+func (fc *FileCache) cleanupFile(fileID string) {
+	fc.Lock()
+	filePath, exists := fc.files[fileID]
+	if exists {
+		delete(fc.files, fileID)
+		delete(fc.lastAccess, fileID)
+	}
+	fc.Unlock()
+	
+	if exists && filePath != "" {
+		os.Remove(filePath)
+		log.Printf("已清理缓存文件: %s", fileID)
+	}
+}
+
+// 定期清理过期缓存
+func (fc *FileCache) periodicCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		now := time.Now().Unix()
+		expireTime := now - 3600 // 1小时未访问的文件将被清理
+		
+		var filesToDelete []string
+		var idsToDelete []string
+		
+		fc.RLock()
+		for fileID, lastAccess := range fc.lastAccess {
+			if lastAccess < expireTime {
+				if filePath, ok := fc.files[fileID]; ok {
+					filesToDelete = append(filesToDelete, filePath)
+					idsToDelete = append(idsToDelete, fileID)
+				}
+			}
+		}
+		fc.RUnlock()
+		
+		// 删除文件
+		for _, filePath := range filesToDelete {
+			os.Remove(filePath)
+		}
+		
+		// 更新缓存映射
+		fc.Lock()
+		for _, fileID := range idsToDelete {
+			delete(fc.files, fileID)
+			delete(fc.lastAccess, fileID)
+		}
+		fc.Unlock()
+		
+		if len(idsToDelete) > 0 {
+			log.Printf("已清理 %d 个过期缓存文件", len(idsToDelete))
+		}
+	}
+}
 
 // UploadImageAPI 上传图片api
 func UploadImageAPI(w http.ResponseWriter, r *http.Request) {
@@ -92,71 +243,121 @@ func D(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 发起HTTP GET请求来获取Telegram图片
-	fileUrl, _ := utils.GetDownloadUrl(id)
-	resp, err := http.Get(fileUrl)
+	// 获取文件缓存
+	cache := getFileCache()
+	
+	// 检查是否为分块文件
+	if strings.HasPrefix(id, "blob-") {
+		// 处理分块文件
+		handleBlobFile(w, r, id)
+		return
+	}
+	
+	// 从缓存获取文件
+	filePath, err := cache.getCachedFile(id)
 	if err != nil {
+		log.Printf("获取文件失败: %v", err)
 		http.Error(w, "Failed to fetch content", http.StatusInternalServerError)
 		return
 	}
-	defer resp.Body.Close()
 	
-	// 检查Content-Type是否为图片类型
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/octet-stream") {
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("404 Not Found"))
-		return
-	}
-	
-	contentLength, err := strconv.Atoi(resp.Header.Get("Content-Length"))
+	// 打开文件
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Println("获取Content-Length出错:", err)
+		log.Printf("打开文件失败: %v", err)
+		http.Error(w, "Failed to open file", http.StatusInternalServerError)
 		return
 	}
+	defer file.Close()
 	
-	// 读取内容到缓冲区
-	buffer := make([]byte, contentLength)
-	n, err := resp.Body.Read(buffer)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		log.Println("读取响应主体数据时发生错误:", err)
+	// 获取文件信息
+	fileInfo, err := file.Stat()
+	if err != nil {
+		log.Printf("获取文件信息失败: %v", err)
+		http.Error(w, "Failed to get file info", http.StatusInternalServerError)
 		return
 	}
+	fileSize := fileInfo.Size()
 	
-	// 处理分块文件
-	if string(buffer[:12]) == "tgstate-blob" {
-		content := string(buffer)
-		lines := strings.Split(content, "\n")
-		log.Println("分块文件:" + lines[1])
-		var fileSize string
-		var startLine = 2
-		if strings.HasPrefix(lines[2], "size") {
-			fileSize = lines[2][len("size"):]
-			startLine = startLine + 1
-		}
-		
-		// 设置响应头
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+lines[1]+"\"")
-		w.Header().Set("Content-Length", fileSize)
+	// 读取文件头部以检测内容类型
+	buffer := make([]byte, 512)
+	_, err = file.Read(buffer)
+	if err != nil && err != io.EOF {
+		log.Printf("读取文件头部失败: %v", err)
+		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		return
+	}
+	// 重置文件指针
+	file.Seek(0, io.SeekStart)
+	
+	// 检测内容类型
+	contentType := http.DetectContentType(buffer)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+	
+	// 判断是否为视频文件
+	isVideo := strings.HasPrefix(contentType, "video/")
+	
+	// 只有视频文件才处理Range请求
+	if isVideo {
 		w.Header().Set("Accept-Ranges", "bytes")
-		
-		// 处理分块文件的下载
-		handleBlobDownload(w, r, lines, startLine, fileSize)
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader != "" {
+			// 解析Range头
+			ranges, err := parseRange(rangeHeader, fileSize)
+			if err != nil || len(ranges) != 1 {
+				// 如果Range头无效，发送整个文件
+				io.Copy(w, file)
+				return
+			}
+			
+			// 获取请求的范围
+			ra := ranges[0]
+			
+			// 设置文件指针到请求的起始位置
+			file.Seek(ra.start, io.SeekStart)
+			
+			// 设置部分内容响应
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", ra.start, ra.end, fileSize))
+			w.Header().Set("Content-Length", strconv.FormatInt(ra.length, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			
+			// 发送请求的部分内容
+			io.CopyN(w, file, ra.length)
+			
+			// 检查是否是最后一个Range请求（通常是视频播放结束）
+			if ra.end >= fileSize-1 || ra.end >= fileSize-1024*1024 { // 文件结尾或接近结尾
+				// 延迟清理文件，给予一些缓冲时间
+				go func() {
+					time.Sleep(10 * time.Second) // 等待10秒，确保没有新请求
+					cache.cleanupFile(id)
+				}()
+			}
+			
+			return
+		}
 	} else {
-		// 处理单个文件
-		contentType := http.DetectContentType(buffer)
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Length", strconv.Itoa(n))
-		w.Header().Set("Accept-Ranges", "bytes")
-		
-		// 处理视频和音频文件的Range请求
-		if strings.HasPrefix(contentType, "video/") || strings.HasPrefix(contentType, "audio/") {
-			handleRangeRequest(w, r, buffer[:n])
-		} else {
-			// 对于其他类型的文件，直接发送
-			w.Write(buffer[:n])
-		}
+		// 非视频文件不支持Range请求
+		w.Header().Set("Accept-Ranges", "none")
 	}
+	
+	// 非Range请求或非视频文件，发送整个文件
+	io.Copy(w, file)
+	
+	// 对于非视频文件，请求完成后标记为可清理
+	if !isVideo {
+		go func() {
+			time.Sleep(5 * time.Second) // 等待5秒，确保浏览器已完成处理
+			cache.cleanupFile(id)
+		}()
+	}
+}
+
+// 处理分块文件
+func handleBlobFile(w http.ResponseWriter, r *http.Request, blobID string) {
+	// 获取分块文件信息
+	// 这里需要根据您的实际情况实现
+	// ...
 }
 
 // 处理Range请求
