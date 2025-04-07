@@ -12,8 +12,9 @@ services:
       - target=${target}
       - mode=${mode}
       - port=${port}
-    env_file:
-      - ./config.env
+    # 移除 env_file 配置，因为我们已经使用 .env 文件
+    # env_file:
+    #   - ./config.env
     restart: always
     volumes:
       - ./data:/app/data
