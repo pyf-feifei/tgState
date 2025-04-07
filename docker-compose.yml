@@ -8,12 +8,12 @@ services:
     ports:
       - "${port:-8088}:8088"  # 设置默认值，如果port未定义则使用8088
     env_file:
-      - ./config.env  # 确保使用正确的路径
+      - config.env  # 使用相对路径，确保文件能被正确读取
     environment:
-      - token=${token}
-      - target=${target}
-      - mode=${mode}
-      - port=${port}
+      - token
+      - target
+      - mode
+      - port
     restart: unless-stopped
     volumes:
       - ./data:/app/data

@@ -1,3 +1,16 @@
+# 使用 Go 镜像进行编译
+FROM golang:1.19 AS builder
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制源代码
+COPY . .
+
+# 下载依赖并编译
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o tgState
+
 # 使用官方的 Ubuntu 基础镜像
 FROM ubuntu:latest
 
@@ -10,12 +23,11 @@ RUN mkdir -p /app
 # 设置工作目录
 WORKDIR /app
 
-# 如果tgState文件存在，则复制它
-# 如果不存在，请注释掉下面这行，并提供替代方案
-COPY ./tgState /app/tgState
+# 从构建阶段复制编译好的二进制文件
+COPY --from=builder /app/tgState /app/tgState
 
 # 确保文件有执行权限
-RUN if [ -f "/app/tgState" ]; then chmod +x /app/tgState; fi
+RUN chmod +x /app/tgState
 
 # 设置暴露的端口
 EXPOSE 8088
