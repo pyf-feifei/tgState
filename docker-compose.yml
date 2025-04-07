@@ -6,9 +6,14 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${port}:8088"
+      - "${port:-8088}:8088"  # 设置默认值，如果port未定义则使用8088
     env_file:
-      - config.env
+      - ./config.env  # 确保使用正确的路径
+    environment:
+      - token=${token}
+      - target=${target}
+      - mode=${mode}
+      - port=${port}
     restart: unless-stopped
     volumes:
       - ./data:/app/data
